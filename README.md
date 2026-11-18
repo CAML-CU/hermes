@@ -54,6 +54,53 @@ A caller sends a typed command to one bot using NATS request/reply. Supported pr
 
 When no command ID is supplied, Hermes generates a UUID. A timeout stops the caller from waiting but does not cancel bot execution. Retrying can therefore execute a command more than once unless the bot deduplicates command IDs.
 
+### Managed bot sessions
+
+Python bots can delegate heartbeat scheduling and command consumption to a Rust-owned `BotSession`. The session starts in `STATUS_WARMING_UP`, publishes heartbeats immediately and periodically, and handles pause, unpause, and get-config commands without involving strategy code.
+
+```python
+import asyncio
+import time
+
+import hermes
+
+
+async def run_strategy_iteration() -> None:
+    ...
+
+
+async def main() -> None:
+    client = await hermes.Hermes.connect("nats://127.0.0.1:4222")
+    bot = await client.start_bot(
+        "bot-1",
+        started_at=time.time_ns(),
+        heartbeat_interval_seconds=5.0,
+        config_json='{"strategy":"market_maker"}',
+    )
+
+    @bot.on_command
+    async def handle_command(command: hermes.BotCommand) -> object:
+        if command.type == hermes.COMMAND_TYPE_MODIFY_CONFIG:
+            bot.set_config(command.data_json)
+            return {"applied": True}
+        return {"handled": False}
+
+    bot.mark_online()
+    try:
+        while bot.is_active():
+            if bot.is_paused():
+                await bot.wait_until_active()
+                continue
+            await run_strategy_iteration()
+    finally:
+        await bot.stop()
+
+
+asyncio.run(main())
+```
+
+`is_active()` remains true while paused and becomes false during shutdown. Pause and unpause commands update the session state before their successful response is sent, so the strategy loop observes the new state immediately. `wait_until_active()` returns when the session becomes online or stops. Custom callbacks run sequentially and may be synchronous or asynchronous; their return value must be `None`, a JSON-object string, or another JSON-serializable object. Callback exceptions are returned to the command caller as failed responses without terminating the session.
+
 ### Active orders
 
 The bot's order store is authoritative; Hermes only transports snapshots and change notifications.

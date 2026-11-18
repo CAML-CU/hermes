@@ -7,6 +7,8 @@ class PythonBindingTests(unittest.TestCase):
     def test_public_api_is_exported(self) -> None:
         expected = {
             "Hermes",
+            "BotSession",
+            "BotCommand",
             "HermesError",
             "QueueFullError",
             "Receipt",
@@ -29,6 +31,8 @@ class PythonBindingTests(unittest.TestCase):
     def test_native_types_live_in_private_module(self) -> None:
         for native_type in (
             hermes.Hermes,
+            hermes.BotSession,
+            hermes.BotCommand,
             hermes.Receipt,
             hermes.Emission,
             hermes.HeartbeatEvent,

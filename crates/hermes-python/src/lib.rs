@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex as StdMutex, RwLock},
+    time::Duration,
+};
 
 use hermes_core::{
     proto, ActiveOrdersRequestSubscription, BotEmissionSubscription, BotHeartbeatSubscription,
@@ -12,7 +15,8 @@ use pyo3::{
     prelude::*,
 };
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 
 create_exception!(_native, HermesError, PyRuntimeError);
 create_exception!(_native, QueueFullError, HermesError);
@@ -184,6 +188,63 @@ impl Hermes {
             .map_err(core_error)?;
         Ok(Receipt {
             receipt: Mutex::new(Some(receipt)),
+        })
+    }
+
+    #[pyo3(signature = (bot_id, started_at, heartbeat_interval_seconds=5.0, config_json="{}"))]
+    fn start_bot<'py>(
+        &self,
+        py: Python<'py>,
+        bot_id: String,
+        started_at: u64,
+        heartbeat_interval_seconds: f64,
+        config_json: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !heartbeat_interval_seconds.is_finite() || heartbeat_interval_seconds <= 0.0 {
+            return Err(PyValueError::new_err(
+                "heartbeat_interval_seconds must be finite and positive",
+            ));
+        }
+        let heartbeat_interval = Duration::try_from_secs_f64(heartbeat_interval_seconds)
+            .map_err(|_| PyValueError::new_err("heartbeat_interval_seconds is too large"))?;
+        let config = parse_data(config_json)?;
+        let core = self.core.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let subscription = core
+                .subscribe_bot_commands(&bot_id)
+                .await
+                .map_err(core_error)?;
+            let state = Arc::new(BotSessionState {
+                core,
+                bot_id,
+                started_at,
+                heartbeat_interval,
+                mutable: RwLock::new(BotSessionMutable {
+                    active: true,
+                    status: proto::Status::WarmingUp as i32,
+                    paused_at: None,
+                    config,
+                }),
+                callback: StdMutex::new(None),
+                changed: Notify::new(),
+                shutdown: Notify::new(),
+                tasks: Mutex::new(Vec::new()),
+            });
+            let _ = state.core.publish_bot_heartbeat(state.heartbeat()).await;
+            let heartbeat_state = state.clone();
+            let heartbeat_task = tokio::spawn(async move {
+                heartbeat_loop(heartbeat_state).await;
+            });
+            let command_state = state.clone();
+            let command_task = tokio::spawn(async move {
+                command_loop(command_state, subscription).await;
+            });
+            state
+                .tasks
+                .lock()
+                .await
+                .extend([heartbeat_task, command_task]);
+            Python::with_gil(|py| Py::new(py, BotSession { state }).map(|value| value.into_py(py)))
         })
     }
 
@@ -697,6 +758,341 @@ struct Emission {
     data_json: String,
 }
 
+struct BotSessionMutable {
+    active: bool,
+    status: i32,
+    paused_at: Option<u64>,
+    config: Struct,
+}
+
+struct BotSessionState {
+    core: HermesCore,
+    bot_id: String,
+    started_at: u64,
+    heartbeat_interval: Duration,
+    mutable: RwLock<BotSessionMutable>,
+    callback: StdMutex<Option<Py<PyAny>>>,
+    changed: Notify,
+    shutdown: Notify,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl BotSessionState {
+    fn heartbeat(&self) -> proto::BotHeartbeat {
+        let state = self.mutable.read().expect("bot session state poisoned");
+        proto::BotHeartbeat {
+            bot_id: self.bot_id.clone(),
+            status: state.status,
+            started_at: self.started_at,
+            paused_at: state.paused_at,
+            config_schema: Some(state.config.clone()),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.mutable
+            .read()
+            .expect("bot session state poisoned")
+            .active
+    }
+}
+
+async fn heartbeat_loop(state: Arc<BotSessionState>) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(state.heartbeat_interval) => {}
+            _ = state.shutdown.notified() => break,
+        }
+        if !state.is_active() {
+            break;
+        }
+        let _ = state.core.publish_bot_heartbeat(state.heartbeat()).await;
+    }
+}
+
+fn command_response(
+    command: &proto::BotCommand,
+    success: bool,
+    message: Struct,
+    error: Option<String>,
+) -> proto::BotCommandResponse {
+    proto::BotCommandResponse {
+        bot_id: command.bot_id.clone(),
+        command_id: command.command_id.clone(),
+        success,
+        message: Some(message),
+        error,
+    }
+}
+
+fn empty_struct() -> Struct {
+    Struct::default()
+}
+
+async fn callback_result(callback: Py<PyAny>, command: proto::BotCommand) -> PyResult<Struct> {
+    let result = Python::with_gil(|py| -> PyResult<CallbackInvocation> {
+        let argument = Py::new(
+            py,
+            BotCommand {
+                bot_id: command.bot_id,
+                command_id: command.command_id,
+                command_type: command.r#type,
+                data_json: struct_json(command.data),
+            },
+        )?;
+        let result = callback.call1(py, (argument,))?;
+        if result.bind(py).hasattr("__await__")? {
+            Ok(CallbackInvocation::Awaitable(result))
+        } else {
+            Ok(CallbackInvocation::Ready(result))
+        }
+    })?;
+    let value = match result {
+        CallbackInvocation::Ready(value) => value,
+        CallbackInvocation::Awaitable(awaitable) => {
+            let future = Python::with_gil(|py| {
+                pyo3_async_runtimes::tokio::into_future(awaitable.bind(py).clone())
+            })?;
+            future.await?
+        }
+    };
+    Python::with_gil(|py| {
+        if value.bind(py).is_none() {
+            return Ok(empty_struct());
+        }
+        let json = if let Ok(value) = value.extract::<String>(py) {
+            value
+        } else {
+            py.import_bound("json")?
+                .call_method1("dumps", (value,))?
+                .extract::<String>()?
+        };
+        parse_data(&json)
+    })
+}
+
+enum CallbackInvocation {
+    Ready(Py<PyAny>),
+    Awaitable(Py<PyAny>),
+}
+
+async fn command_loop(
+    state: Arc<BotSessionState>,
+    mut subscription: hermes_core::BotCommandSubscription,
+) {
+    while state.is_active() {
+        let incoming = tokio::select! {
+            incoming = subscription.next() => incoming,
+            _ = state.shutdown.notified() => break,
+        };
+        let incoming = match incoming {
+            Ok(Some(incoming)) => incoming,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        let command = incoming.command.clone();
+        let response = match command.r#type {
+            1 => {
+                {
+                    let mut mutable = state.mutable.write().expect("bot session state poisoned");
+                    mutable.status = proto::Status::Paused as i32;
+                    mutable.paused_at = None;
+                }
+                state.changed.notify_waiters();
+                command_response(&command, true, empty_struct(), None)
+            }
+            2 => {
+                {
+                    let mut mutable = state.mutable.write().expect("bot session state poisoned");
+                    mutable.status = proto::Status::Online as i32;
+                    mutable.paused_at = None;
+                }
+                state.changed.notify_waiters();
+                command_response(&command, true, empty_struct(), None)
+            }
+            3 => {
+                let config = state
+                    .mutable
+                    .read()
+                    .expect("bot session state poisoned")
+                    .config
+                    .clone();
+                command_response(&command, true, config, None)
+            }
+            _ => {
+                let callback = Python::with_gil(|py| {
+                    state
+                        .callback
+                        .lock()
+                        .expect("bot callback lock poisoned")
+                        .as_ref()
+                        .map(|callback| callback.clone_ref(py))
+                });
+                match callback {
+                    Some(callback) => match callback_result(callback, command.clone()).await {
+                        Ok(message) => command_response(&command, true, message, None),
+                        Err(error) => command_response(
+                            &command,
+                            false,
+                            empty_struct(),
+                            Some(error.to_string()),
+                        ),
+                    },
+                    None => command_response(
+                        &command,
+                        false,
+                        empty_struct(),
+                        Some("no command callback registered".to_owned()),
+                    ),
+                }
+            }
+        };
+        let _ = incoming.respond(response).await;
+    }
+}
+
+#[pyclass(module = "hermes._native")]
+struct BotSession {
+    state: Arc<BotSessionState>,
+}
+
+impl Drop for BotSession {
+    fn drop(&mut self) {
+        if let Ok(mut mutable) = self.state.mutable.write() {
+            mutable.active = false;
+            mutable.status = proto::Status::ShuttingDown as i32;
+            mutable.paused_at = None;
+        }
+        self.state.changed.notify_waiters();
+        self.state.shutdown.notify_waiters();
+    }
+}
+
+#[pymethods]
+impl BotSession {
+    #[getter]
+    fn bot_id(&self) -> &str {
+        &self.state.bot_id
+    }
+
+    #[getter]
+    fn status(&self) -> i32 {
+        self.state
+            .mutable
+            .read()
+            .expect("bot session state poisoned")
+            .status
+    }
+
+    fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
+
+    fn is_paused(&self) -> bool {
+        self.status() == proto::Status::Paused as i32
+    }
+
+    fn mark_online(&self) {
+        let mut state = self
+            .state
+            .mutable
+            .write()
+            .expect("bot session state poisoned");
+        state.status = proto::Status::Online as i32;
+        state.paused_at = None;
+        drop(state);
+        self.state.changed.notify_waiters();
+    }
+
+    #[pyo3(signature = (paused_at=None))]
+    fn pause(&self, paused_at: Option<u64>) {
+        let mut state = self
+            .state
+            .mutable
+            .write()
+            .expect("bot session state poisoned");
+        state.status = proto::Status::Paused as i32;
+        state.paused_at = paused_at;
+        drop(state);
+        self.state.changed.notify_waiters();
+    }
+
+    fn unpause(&self) {
+        self.mark_online();
+    }
+
+    fn set_config(&self, config_json: &str) -> PyResult<()> {
+        let config = parse_data(config_json)?;
+        self.state
+            .mutable
+            .write()
+            .expect("bot session state poisoned")
+            .config = config;
+        Ok(())
+    }
+
+    fn on_command<'py>(&self, callback: Py<PyAny>, py: Python<'py>) -> Py<PyAny> {
+        *self
+            .state
+            .callback
+            .lock()
+            .expect("bot callback lock poisoned") = Some(callback.clone_ref(py));
+        callback
+    }
+
+    fn wait_until_active<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            loop {
+                let notified = state.changed.notified();
+                let (active, status) = {
+                    let mutable = state.mutable.read().expect("bot session state poisoned");
+                    (mutable.active, mutable.status)
+                };
+                if !active || status == proto::Status::Online as i32 {
+                    return Ok(());
+                }
+                notified.await;
+            }
+        })
+    }
+
+    fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            {
+                let mut mutable = state.mutable.write().expect("bot session state poisoned");
+                if !mutable.active {
+                    return Ok(());
+                }
+                mutable.active = false;
+                mutable.status = proto::Status::ShuttingDown as i32;
+                mutable.paused_at = None;
+            }
+            state.changed.notify_waiters();
+            state.shutdown.notify_waiters();
+            let _ = state.core.publish_bot_heartbeat(state.heartbeat()).await;
+            for task in state.tasks.lock().await.drain(..) {
+                task.abort();
+                let _ = task.await;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[pyclass(frozen, module = "hermes._native")]
+struct BotCommand {
+    #[pyo3(get)]
+    bot_id: String,
+    #[pyo3(get)]
+    command_id: String,
+    #[pyo3(get, name = "type")]
+    command_type: i32,
+    #[pyo3(get)]
+    data_json: String,
+}
+
 #[pyclass(frozen, module = "hermes._native")]
 struct CommandResponse {
     #[pyo3(get)]
@@ -726,6 +1122,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("COMMAND_TYPE_GET_CONFIG", 3)?;
     m.add("COMMAND_TYPE_MODIFY_CONFIG", 4)?;
     m.add_class::<Hermes>()?;
+    m.add_class::<BotSession>()?;
+    m.add_class::<BotCommand>()?;
     m.add_class::<Receipt>()?;
     m.add_class::<Emissions>()?;
     m.add_class::<BotHeartbeats>()?;
