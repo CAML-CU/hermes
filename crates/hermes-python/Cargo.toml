@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Python bindings for Hermes Core"
 
 [lib]
-name = "hermes_python"
+name = "_native"
 crate-type = ["cdylib"]
 
 [features]

@@ -8,6 +8,7 @@ description = "NATS Core transport for Hermes"
 async-nats.workspace = true
 futures-util.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
 uuid = { workspace = true, features = ["v4"] }

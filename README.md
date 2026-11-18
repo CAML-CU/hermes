@@ -1,18 +1,71 @@
 # Hermes
 
-Hermes is a Cargo workspace with two members: `crates/hermes-core` owns the Rust NATS Core transport and Prost-generated protobuf types; `crates/hermes-python` exposes a PyO3 API over that core. Python never connects to NATS or uses a protobuf runtime. Hermes transports control, observability, and current order state, **never trades**. The `.proto` definitions live in `proto/trading/v1/`; `services.proto` does not generate gRPC clients or servers here.
+Hermes is a lightweight messaging layer for operating and observing automated trading bots. It gives bot processes, a market-data wrangler, and control-plane applications a shared protocol for:
 
-## Build and validate
+- publishing health and lifecycle heartbeats;
+- streaming bot emissions such as logs, metrics, and risk events;
+- sending commands to bots and receiving responses;
+- fetching a bot's current active-order state; and
+- notifying consumers when that order state changes.
 
-Install a Rust toolchain, `protoc`, and Buf. From the repository root:
+Hermes transports these messages over [NATS Core](https://docs.nats.io/nats-concepts/core-nats) using protobuf payloads. The transport is implemented in Rust and exposed to Python through PyO3, so Python applications do not need their own NATS or protobuf integration.
 
-```sh
-buf lint
-buf build
-cargo test --workspace
+Hermes is **not** a trading engine. It does not place orders, connect to exchanges, own bot state, persist events, or provide delivery guarantees. Bots and the wrangler remain responsible for their own behavior and state.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    Control[Control plane or dashboard]
+    Bot[Trading bot]
+    Wrangler[Market-data wrangler]
+    NATS[NATS Core]
+
+    Control <-->|commands and order snapshots| NATS
+    Bot <-->|commands, emissions, heartbeats, orders| NATS
+    Wrangler -->|heartbeats| NATS
 ```
 
-Unit tests live in `src/tests.rs` in each workspace member. To install the Python extension, install Maturin in a Python virtual environment and run `maturin develop` from `crates/hermes-python` (or `python -m pip install .` there). Running the transport requires a NATS server; no JetStream is used.
+The workspace contains two libraries:
+
+- `crates/hermes-core` — async Rust transport built on `async-nats`, plus Prost-generated types from `proto/trading/v1`.
+- `crates/hermes-python` — native PyO3 extension exposed privately as `hermes._native`.
+- `python/hermes` — typed public Python package that re-exports the native API.
+
+The `.proto` files define the wire format shared by all participants. `services.proto` documents an observability service shape, but Hermes currently uses NATS subjects directly and does not generate or run gRPC clients or servers.
+
+## Supported workflows
+
+### Bot and wrangler liveness
+
+Bots publish their identity, status, start time, optional pause time, and configuration metadata. The singleton wrangler publishes the same lifecycle information without an instance ID. Consumers subscribe to these heartbeats and decide for themselves when a producer should be considered offline.
+
+Hermes does not schedule heartbeats or enforce an expiry interval. Timestamp values are supplied by callers; their units are not currently enforced by the protocol.
+
+### Bot emissions
+
+Bots can publish arbitrary typed JSON objects for observability—for example, a risk warning, strategy decision, or diagnostic event. Emissions use a bounded, non-blocking queue so a slow NATS connection does not block a latency-sensitive producer.
+
+`HermesCore::try_publish_emission` and Python's `try_emit` return immediately. They report `QueueFull`/`QueueFullError` if the configured queue is full. The returned receipt can be awaited to detect a publish error, but it is not an acknowledgment from a subscriber.
+
+### Bot commands
+
+A caller sends a typed command to one bot using NATS request/reply. Supported protocol command types are pause, unpause, get configuration, and modify configuration. The bot handles the request and responds with success or failure, optional JSON data, and the same command ID.
+
+When no command ID is supplied, Hermes generates a UUID. A timeout stops the caller from waiting but does not cancel bot execution. Retrying can therefore execute a command more than once unless the bot deduplicates command IDs.
+
+### Active orders
+
+The bot's order store is authoritative; Hermes only transports snapshots and change notifications.
+
+A consumer should:
+
+1. Subscribe to order-change notifications.
+2. Request the bot's current active-order snapshot.
+3. Refetch when a newer version or generation is announced.
+4. Refetch after reconnecting, because notifications are not retained.
+
+Each bot process uses a nonempty `generation_id`, normally changed after restart, and increments `version` whenever its order state changes. Snapshots are limited to **1 MiB of encoded protobuf**. Prices and quantities are decimal strings to preserve exact values without floating-point conversion.
 
 ## NATS subjects
 
@@ -25,44 +78,156 @@ Unit tests live in `src/tests.rs` in each workspace member. To install the Pytho
 | `hermes.heartbeats.bots` | `BotHeartbeat` | Publish/subscribe |
 | `hermes.heartbeats.wranglers` | `WranglerHeartbeat` | Publish/subscribe |
 
-Bot IDs in subjects must be nonempty and contain only ASCII letters, digits, `_`, or `-`. Bot heartbeats include a bot ID; the singleton wrangler heartbeat needs no instance ID. Publishers and subscribers use separate heartbeat topics. Callers schedule heartbeats; consumers detect liveness using receipt time and their own expiry policy.
+Bot IDs become individual NATS subject tokens. They must be nonempty and may contain only ASCII letters, digits, `_`, and `-`.
 
-**Core NATS is ephemeral:** subscribe before publishing, and refetch state after reconnecting. A successful publish means the client accepted the message, not that any subscriber processed it. Command requests use caller-supplied IDs (or an auto-generated UUID); handlers echo the bot and command IDs. Request timeouts do not cancel execution, and retries can execute commands twice unless handlers deduplicate them.
+Hermes uses NATS Core rather than JetStream. Messages are ephemeral: subscribers must be connected before publication, and consumers must recover current state after a disconnect. A successful publish only means that the NATS client accepted the message; it does not prove that a subscriber received or processed it.
 
-Bot emissions may be frequent. `HermesCore::try_publish_emission` (Python: `try_emit`) enqueues without waiting for NATS and reports `QueueFull` (`QueueFullError` in Python) when its bounded queue fills. Its optional receipt can be awaited for publish errors, **not** delivery acknowledgments. The bound applies to queued message count, not total bytes or NATS's internal buffers. Use one connected client per producer to share that queue.
+## Python quick start
 
-## Python API
+### Prerequisites
 
-The extension exposes async connection, heartbeat publishing/subscriptions, command requests, order snapshots, and notifications. Python does not import a NATS client. For example:
+- a Rust toolchain;
+- Python and a virtual environment;
+- `protoc` for protobuf code generation;
+- a running NATS server; and
+- [Maturin](https://www.maturin.rs/) to build the extension.
+
+Install the extension into the active Python environment:
+
+```sh
+python -m pip install maturin
+maturin develop
+```
+
+Connect, subscribe, and publish an emission:
 
 ```python
 import asyncio
-import hermes_python as hermes
+import hermes
+
 
 async def main():
-    client = await hermes.Hermes.connect("nats://127.0.0.1:4222", emission_capacity=4096)
+    client = await hermes.Hermes.connect(
+        "nats://127.0.0.1:4222",
+        emission_capacity=4096,
+    )
 
     emissions = await client.subscribe_bot_emissions("bot-1")
-    receipt = client.try_emit("bot-1", "risk_alert", '{"reason":"exposure_limit"}')
-    await receipt.wait()  # Optional; not a subscriber acknowledgment.
-    event = await emissions.next()  # None when the subscription ends.
 
-    bot_heartbeats = await client.subscribe_bot_heartbeats()
-    wrangler_heartbeats = await client.subscribe_wrangler_heartbeats()
-    await client.publish_bot_heartbeat("bot-1", hermes.STATUS_ONLINE, started_at=1730000000,
-                                       config_json='{"strategy":"example"}')
-    await client.publish_wrangler_heartbeat(hermes.STATUS_ONLINE, started_at=1730000000)
-    heartbeat = await wrangler_heartbeats.next()
+    receipt = client.try_emit(
+        "bot-1",
+        "risk_alert",
+        '{"reason":"exposure_limit"}',
+    )
+    await receipt.wait()  # Publish result, not subscriber acknowledgment.
+
+    event = await emissions.next()
+    if event is not None:
+        print(event.bot_id, event.emission_type, event.data_json)
+
 
 asyncio.run(main())
 ```
 
-`BotHeartbeats.next()` and `WranglerHeartbeats.next()` return read-only `HeartbeatEvent` values with `source_kind`, `source_id`, `status`, `started_at`, `paused_at`, and `config_json`. Wrangler events have the constant `source_id` `"wrangler"` and no config; bot events carry their bot ID and config JSON (`"{}"` when absent). The time fields are unsigned integer values supplied by the caller; the protocol does not currently enforce their units. Bot heartbeat config and other `data_json` inputs must be JSON objects. `request_bot_command(bot_id, command_type, data_json="{}", command_id="", timeout_seconds=5.0)` returns a response with a matching command ID; `COMMAND_TYPE_*` and `STATUS_*` constants are available from the extension.
+Publish and observe heartbeats:
 
-## Active orders
+```python
+heartbeats = await client.subscribe_bot_heartbeats()
 
-The **bot's order store**, not Hermes, is authoritative. A bot serves `subscribe_active_orders_requests(bot_id)`; each incoming request's async `respond(generation_id, version, as_of_unix_ns, orders_json)` sends its current snapshot. Clients call `request_active_orders(bot_id, timeout_seconds=5.0)` and may subscribe to `subscribe_orders_changed(bot_id)`. The bot publishes `publish_orders_changed(bot_id, generation_id, version)` when the state changes. Subscribe to notifications first, request a snapshot, and refetch if a newer version or generation appears; refetch after reconnecting because notifications are not retained.
+await client.publish_bot_heartbeat(
+    "bot-1",
+    hermes.STATUS_ONLINE,
+    started_at=1730000000,
+    config_json='{"strategy":"market_maker"}',
+)
 
-Snapshots and notifications require a nonempty `generation_id` and positive `version`. Increment the version for each change within a generation and use a new generation ID after restarting the bot. Snapshot replies must match the requested bot ID and fit within **1 MiB of encoded protobuf**. An oversized snapshot cannot be sent and its requester may time out.
+heartbeat = await heartbeats.next()
+print(heartbeat.source_id, heartbeat.status, heartbeat.config_json)
+```
 
-In Python, `orders_json` is an array of order objects with string `venue`, `symbol`, `order_id`, `client_order_id`, `side`, `status`, `total_quantity`, and `filled_quantity`, plus nullable string `limit_price`. Decimal prices and quantities are **strings**, not JSON numbers, so no floating-point conversion is required. Invalid shapes or fields raise `ValueError` before consuming a request. `ActiveOrdersSnapshot` exposes `bot_id`, `generation_id`, `version`, `as_of_unix_ns`, and `orders_json`; `OrdersChangedNotification` exposes `bot_id`, `generation_id`, and `version`. Notifications are refresh hints, not an order history. A request can be answered only once, and cancelling a response does not make it reusable.
+Send a bot command:
+
+```python
+response = await client.request_bot_command(
+    "bot-1",
+    hermes.COMMAND_TYPE_PAUSE,
+    data_json='{"reason":"operator_request"}',
+    timeout_seconds=5.0,
+)
+
+if not response.success:
+    raise RuntimeError(response.error)
+```
+
+JSON arguments such as `data_json` and `config_json` must contain JSON objects. Subscription `next()` methods return `None` when their subscription ends.
+
+## Active-order JSON format
+
+Python order responders pass `orders_json` as an array of objects:
+
+```json
+[
+  {
+    "venue": "example",
+    "symbol": "BTC-USD",
+    "order_id": "venue-order-123",
+    "client_order_id": "bot-order-123",
+    "side": "buy",
+    "status": "open",
+    "limit_price": "65000.25",
+    "total_quantity": "0.10",
+    "filled_quantity": "0.02"
+  }
+]
+```
+
+All fields are strings except `limit_price`, which may be `null`. Unknown or incorrectly typed fields raise `ValueError` before a request is consumed. An active-order request can be answered only once.
+
+## Repository layout
+
+```text
+.
+├── crates/
+│   ├── hermes-core/       # Rust NATS transport and generated protobuf API
+│   └── hermes-python/     # Async Python bindings
+├── proto/trading/v1/      # Versioned protobuf wire definitions
+├── Cargo.toml             # Rust workspace
+└── buf.yaml               # Protobuf lint configuration
+```
+
+## Examples
+
+With a NATS server running at `nats://127.0.0.1:4222`, run either client from the repository root:
+
+```sh
+python examples/basic.py
+cargo run -p hermes-core --example basic
+```
+
+The Python example uses the public `hermes` package. The Rust example uses `HermesCore` directly. Both subscribe before publishing because NATS Core does not retain emissions.
+
+## Build and test
+
+From the repository root:
+
+```sh
+buf lint
+buf build
+cargo test --workspace
+```
+
+`cargo check` and the Rust tests do not require a live NATS server for their current unit coverage. Running an application against Hermes does require NATS. No JetStream setup is needed.
+
+## Delivery and recovery semantics
+
+Hermes deliberately favors a small, low-latency transport over durable messaging:
+
+- publish/subscribe messages are not retained;
+- publish success is not a processing acknowledgment;
+- subscriptions should be established before producers publish;
+- request timeouts do not cancel remote work;
+- command handlers should deduplicate command IDs when retries are possible;
+- order notifications are refresh hints, not an order history; and
+- consumers should refetch authoritative state after gaps or reconnects.
+
+These constraints make Hermes suitable for live control and observability while keeping durable business state in the systems that own it.

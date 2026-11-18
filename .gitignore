@@ -1,0 +1,111 @@
+# Rust and Cargo
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.pyright/
+.ruff_cache/
+.hypothesis/
+
+# uv and Python environments
+.venv/
+venv/
+env/
+ENV/
+.uv-cache/
+
+# Python packaging
+/build/
+/dist/
+/site/
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+wheelhouse/
+MANIFEST
+
+# PyO3, Maturin, and native build artifacts
+*.so
+*.pyd
+*.pdb
+*.dylib
+*.dll
+*.dSYM/
+
+# Coverage and test reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest-report/
+junit.xml
+
+# Documentation builds
+/docs/_build/
+/site/
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+.direnv/
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Logs, temporary files, and local caches
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+.cache/
+.tmp/
+tmp/
+
+# Editors and IDEs
+.idea/
+.vscode/
+.zed/
+*.code-workspace
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Operating systems
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Windows crash and debug output
+*.stackdump
+*.dmp

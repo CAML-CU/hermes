@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hermes"
+version = "0.1.0"
+description = "NATS control and observability transport for trading bots"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.15,<2",
+]
+
+[tool.maturin]
+manifest-path = "crates/hermes-python/Cargo.toml"
+python-source = "python"
+module-name = "hermes._native"
+features = ["python-extension"]

@@ -1,0 +1,155 @@
+from typing import Final, final
+from collections.abc import Awaitable
+
+STATUS_UNSPECIFIED: Final[int]
+STATUS_SHUTTING_DOWN: Final[int]
+STATUS_WARMING_UP: Final[int]
+STATUS_PAUSED: Final[int]
+STATUS_ONLINE: Final[int]
+COMMAND_TYPE_UNSPECIFIED: Final[int]
+COMMAND_TYPE_PAUSE: Final[int]
+COMMAND_TYPE_UNPAUSE: Final[int]
+COMMAND_TYPE_GET_CONFIG: Final[int]
+COMMAND_TYPE_MODIFY_CONFIG: Final[int]
+
+class HermesError(RuntimeError):
+    """An error reported by the Hermes transport."""
+
+class QueueFullError(HermesError):
+    """The bounded emission queue has no remaining capacity."""
+
+@final
+class Hermes:
+    @staticmethod
+    def connect(url: str, emission_capacity: int = 1024) -> Awaitable[Hermes]: ...
+    def try_emit(self, bot_id: str, emission_type: str, data_json: str = "{}") -> Receipt: ...
+    def publish_bot_heartbeat(
+        self,
+        bot_id: str,
+        status: int,
+        started_at: int,
+        paused_at: int | None = None,
+        config_json: str = "{}",
+    ) -> Awaitable[None]: ...
+    def publish_wrangler_heartbeat(
+        self,
+        status: int,
+        started_at: int,
+        paused_at: int | None = None,
+    ) -> Awaitable[None]: ...
+    def subscribe_bot_heartbeats(self) -> Awaitable[BotHeartbeats]: ...
+    def subscribe_wrangler_heartbeats(self) -> Awaitable[WranglerHeartbeats]: ...
+    def subscribe_bot_emissions(self, bot_id: str) -> Awaitable[Emissions]: ...
+    def request_bot_command(
+        self,
+        bot_id: str,
+        command_type: int,
+        data_json: str = "{}",
+        command_id: str = "",
+        timeout_seconds: float = 5.0,
+    ) -> Awaitable[CommandResponse]: ...
+    def request_active_orders(
+        self, bot_id: str, timeout_seconds: float = 5.0
+    ) -> Awaitable[ActiveOrdersSnapshot]: ...
+    def subscribe_active_orders_requests(
+        self, bot_id: str
+    ) -> Awaitable[ActiveOrdersRequests]: ...
+    def publish_orders_changed(
+        self, bot_id: str, generation_id: str, version: int
+    ) -> Awaitable[None]: ...
+    def subscribe_orders_changed(self, bot_id: str) -> Awaitable[OrdersChanged]: ...
+
+@final
+class Receipt:
+    def wait(self) -> Awaitable[None]: ...
+
+@final
+class Emissions:
+    def next(self) -> Awaitable[Emission | None]: ...
+
+@final
+class BotHeartbeats:
+    def next(self) -> Awaitable[HeartbeatEvent | None]: ...
+
+@final
+class WranglerHeartbeats:
+    def next(self) -> Awaitable[HeartbeatEvent | None]: ...
+
+@final
+class ActiveOrdersRequests:
+    def next(self) -> Awaitable[ActiveOrdersRequest | None]: ...
+
+@final
+class ActiveOrdersRequest:
+    @property
+    def bot_id(self) -> str: ...
+    def respond(
+        self,
+        generation_id: str,
+        version: int,
+        as_of_unix_ns: int,
+        orders_json: str,
+    ) -> Awaitable[None]: ...
+
+@final
+class OrdersChanged:
+    def next(self) -> Awaitable[OrdersChangedNotification | None]: ...
+
+@final
+class ActiveOrdersSnapshot:
+    @property
+    def bot_id(self) -> str: ...
+    @property
+    def generation_id(self) -> str: ...
+    @property
+    def version(self) -> int: ...
+    @property
+    def as_of_unix_ns(self) -> int: ...
+    @property
+    def orders_json(self) -> str: ...
+
+@final
+class OrdersChangedNotification:
+    @property
+    def bot_id(self) -> str: ...
+    @property
+    def generation_id(self) -> str: ...
+    @property
+    def version(self) -> int: ...
+
+@final
+class HeartbeatEvent:
+    @property
+    def source_kind(self) -> str: ...
+    @property
+    def source_id(self) -> str: ...
+    @property
+    def status(self) -> int: ...
+    @property
+    def started_at(self) -> int: ...
+    @property
+    def paused_at(self) -> int | None: ...
+    @property
+    def config_json(self) -> str | None: ...
+
+@final
+class Emission:
+    @property
+    def bot_id(self) -> str: ...
+    @property
+    def emission_type(self) -> str: ...
+    @property
+    def data_json(self) -> str: ...
+
+@final
+class CommandResponse:
+    @property
+    def bot_id(self) -> str: ...
+    @property
+    def command_id(self) -> str: ...
+    @property
+    def success(self) -> bool: ...
+    @property
+    def message_json(self) -> str: ...
+    @property
+    def error(self) -> str | None: ...
