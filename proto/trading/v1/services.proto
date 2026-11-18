@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package trading.v1;
+
+import "trading/v1/bot.proto";
+import "trading/v1/wrangler.proto";
+
+service BotObservabilityService {
+  rpc ObserveEvents(stream BotCommand) returns (stream BotObservabilityMessage) {}
+}
+
+service WranglerObservabilityService {
+  rpc ObserveEvents(stream WranglerCommand) returns (stream WranglerObservabilityMessage) {}
+}

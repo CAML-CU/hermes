@@ -1,0 +1,21 @@
+[package]
+name = "hermes-python"
+version.workspace = true
+edition.workspace = true
+description = "Python bindings for Hermes Core"
+
+[lib]
+name = "hermes_python"
+crate-type = ["cdylib"]
+
+[features]
+python-extension = ["pyo3/extension-module"]
+
+[dependencies]
+hermes-core = { path = "../hermes-core" }
+prost-types.workspace = true
+pyo3.workspace = true
+pyo3-async-runtimes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }

@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package trading.v1;
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_SHUTTING_DOWN = 1;
+  STATUS_WARMING_UP = 2;
+  STATUS_PAUSED = 3;
+  STATUS_ONLINE = 4;
+}
+
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  COMMAND_TYPE_PAUSE = 1;
+  COMMAND_TYPE_UNPAUSE = 2;
+  COMMAND_TYPE_GET_CONFIG = 3;
+  COMMAND_TYPE_MODIFY_CONFIG = 4;
+}

@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package trading.v1;
+
+// Request the bot's current order state; this is not a historical trade feed.
+message BotActiveOrdersRequest {
+  string bot_id = 1;
+}
+
+message ActiveOrder {
+  string venue = 1;
+  string symbol = 2;
+  string order_id = 3;
+  string client_order_id = 4;
+  string side = 5;
+  string status = 6;
+  // Decimal strings preserve exact values without a floating-point conversion.
+  optional string limit_price = 7;
+  string total_quantity = 8;
+  string filled_quantity = 9;
+}
+
+message BotActiveOrdersSnapshot {
+  string bot_id = 1;
+  // Changes when a bot restarts; version increases within one generation.
+  string generation_id = 2;
+  uint64 version = 3;
+  int64 as_of_unix_ns = 4;
+  repeated ActiveOrder orders = 5;
+}
+
+// Notification only: fetch a snapshot to recover current state after a gap.
+message BotOrdersChanged {
+  string bot_id = 1;
+  string generation_id = 2;
+  uint64 version = 3;
+}

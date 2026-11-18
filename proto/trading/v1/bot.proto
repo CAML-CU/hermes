@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package trading.v1;
+
+import "google/protobuf/struct.proto";
+import "trading/v1/common.proto";
+
+message BotEmission {
+  string bot_id = 1;
+  string emission_type = 2;
+  google.protobuf.Struct data = 3;
+}
+
+message BotHeartbeat {
+  string bot_id = 1;
+  Status status = 2;
+  uint64 started_at = 3;
+  google.protobuf.Struct config_schema = 4;
+  optional uint64 paused_at = 5;
+}
+
+message BotCommand {
+  string bot_id = 1;
+  CommandType type = 2;
+  google.protobuf.Struct data = 3; //json formatted
+  // Client-generated identifier used to match a response to this command.
+  string command_id = 4;
+}
+
+message BotCommandResponse {
+  string bot_id = 1;
+  bool success = 2;
+  google.protobuf.Struct message = 3;
+  optional string error = 4;
+  // Echoes BotCommand.command_id unchanged; empty for legacy commands without an ID.
+  string command_id = 5;
+}
+
+message BotObservabilityMessage {
+  oneof message {
+    BotHeartbeat heartbeat = 1;
+    BotEmission emission = 2;
+    BotCommandResponse response = 3;
+  }
+}

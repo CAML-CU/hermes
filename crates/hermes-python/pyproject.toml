@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hermes-python"
+version = "0.1.0"
+description = "Rust-backed Hermes Core Python bindings"
+requires-python = ">=3.9"
+
+[tool.maturin]
+module-name = "hermes_python"
+features = ["python-extension"]

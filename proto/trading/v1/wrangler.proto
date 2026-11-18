@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package trading.v1;
+
+import "google/protobuf/struct.proto";
+import "trading/v1/common.proto";
+
+message TickerConfig {
+  bool enabled = 1;
+}
+
+message TradeConfig {
+  bool enabled = 1;
+}
+
+message L2Config {
+  bool enabled = 1;
+  uint32 depth = 2;
+  uint64 snapshot_interval_ms = 3;
+}
+
+message L3Config {
+  bool enabled = 1;
+  uint32 depth = 2;
+  uint64 snapshot_interval_ms = 3;
+}
+
+message SymbolConfig {
+  string symbol = 1;
+  TickerConfig ticker = 2;
+  TradeConfig trades = 3;
+  L2Config l2 = 4;
+  L3Config l3 = 5;
+}
+
+message SymbolConfigList {
+  repeated SymbolConfig symbols = 1;
+}
+
+message WranglerConfig {
+  map<string, SymbolConfigList> venues = 1;
+}
+
+message WranglerHeartbeat {
+  Status status = 1;
+  uint64 started_at = 3;
+  optional uint64 paused_at = 5;
+  reserved 6;
+  reserved "wrangler_id";
+}
+
+message WranglerCommand {
+  CommandType type = 2;
+  google.protobuf.Struct data = 3;
+}
+
+message WranglerResponse {
+  bool success = 2;
+  google.protobuf.Struct message = 3;
+  optional string error = 4;
+}
+
+message WranglerObservabilityMessage {
+  oneof message {
+    WranglerHeartbeat heartbeat = 1;
+    WranglerResponse response = 2;
+  }
+}

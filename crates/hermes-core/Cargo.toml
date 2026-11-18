@@ -1,0 +1,16 @@
+[package]
+name = "hermes-core"
+version.workspace = true
+edition.workspace = true
+description = "NATS Core transport for Hermes"
+
+[dependencies]
+async-nats.workspace = true
+futures-util.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[build-dependencies]
+prost-build.workspace = true
